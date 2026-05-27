@@ -1,20 +1,17 @@
-import { StatusBar } from 'expo-status-bar';
-import { StyleSheet, Text, View } from 'react-native';
+// ============================================================
+//  App.js  — エントリーポイント
+//  プラットフォームを自動判定して画面を切り替えます
+// ============================================================
+import React from 'react';
+import { Platform, StatusBar } from 'react-native';
+import AndroidScreen from './AndroidScreen';
+import IPhoneScreen from './IPhoneScreen';
 
 export default function App() {
   return (
-    <View style={styles.container}>
-      <Text>Open up App.js to start working on your app!</Text>
-      <StatusBar style="auto" />
-    </View>
+    <>
+      <StatusBar barStyle="light-content" backgroundColor="#080812" />
+      {Platform.OS === 'android' ? <AndroidScreen /> : <IPhoneScreen />}
+    </>
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
