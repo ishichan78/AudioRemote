@@ -2,19 +2,24 @@
 //  IPhoneScreen.js
 //  ・Firebase から登録済み音声ファイルの一覧を取得
 //  ・ボタンタップで Android に再生/停止コマンドを送信
+//  ・音量スライダーで Android の再生音量をリアルタイム制御
 // ============================================================
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity,
-  StyleSheet, SafeAreaView, Animated,
+  StyleSheet, SafeAreaView,
 } from 'react-native';
+import Slider from '@react-native-community/slider';
 import { database } from './firebaseConfig';
 import { ref, onValue, set } from 'firebase/database';
+
+const DEFAULT_VOLUME = 0.8;
 
 export default function IPhoneScreen() {
   const [audioFiles, setAudioFiles] = useState([]);
   const [playingId,  setPlayingId]  = useState(null);
   const [connected,  setConnected]  = useState(false);
+  const [volume,     setVolume]     = useState(DEFAULT_VOLUME);  // 0.0〜1.0
 
   // ── Firebase: 登録済みファイル一覧を監視 ────────────────────
   useEffect(() => {
@@ -38,13 +43,23 @@ export default function IPhoneScreen() {
   }, []);
 
   // ── Firebase: コマンドノードを監視して UI を同期 ─────────────
-  //    （別のデバイスや操作で状態が変わった場合も追従）
   useEffect(() => {
     const commandRef = ref(database, 'command');
     return onValue(commandRef, (snapshot) => {
       const cmd = snapshot.val();
       if (!cmd) return;
       setPlayingId(cmd.action === 'play' ? cmd.fileId : null);
+    });
+  }, []);
+
+  // ── Firebase: 音量ノードを監視（他端末からの変更も反映）───────
+  useEffect(() => {
+    const volumeRef = ref(database, 'volume');
+    return onValue(volumeRef, (snapshot) => {
+      const v = snapshot.val();
+      if (v !== null && typeof v === 'number') {
+        setVolume(v);
+      }
     });
   }, []);
 
@@ -55,7 +70,6 @@ export default function IPhoneScreen() {
       fileId,
       timestamp: Date.now(),
     });
-    // UI は Firebase の応答で更新されるが即時反映のため先に更新
     setPlayingId(action === 'play' ? fileId : null);
   };
 
@@ -65,6 +79,12 @@ export default function IPhoneScreen() {
     } else {
       sendCommand('play', item.id);
     }
+  };
+
+  // ── 音量変更：スライダーを離したときに Firebase へ書き込み ────
+  const handleVolumeChange = async (value) => {
+    setVolume(value);
+    await set(ref(database, 'volume'), value);
   };
 
   // ── UI ────────────────────────────────────────────────────
@@ -79,6 +99,31 @@ export default function IPhoneScreen() {
         <View style={s.badge}>
           <View style={[s.badgeDot, connected ? s.dotOn : s.dotOff]} />
           <Text style={s.badgeText}>{connected ? 'オンライン' : '接続中…'}</Text>
+        </View>
+      </View>
+
+      {/* 音量コントロール */}
+      <View style={s.volumeCard}>
+        <View style={s.volumeHeader}>
+          <Text style={s.volumeLabel}>🔈 音量</Text>
+          <Text style={s.volumeValue}>{Math.round(volume * 100)}%</Text>
+        </View>
+        <Slider
+          style={s.slider}
+          minimumValue={0}
+          maximumValue={1}
+          step={0.01}
+          value={volume}
+          onValueChange={setVolume}          // ローカル UI をリアルタイム更新
+          onSlidingComplete={handleVolumeChange} // 離したときだけ Firebase に書き込み
+          minimumTrackTintColor="#00e5a0"
+          maximumTrackTintColor="#1a1a30"
+          thumbTintColor="#00e5a0"
+        />
+        <View style={s.volumeTicks}>
+          <Text style={s.volumeTick}>0%</Text>
+          <Text style={s.volumeTick}>50%</Text>
+          <Text style={s.volumeTick}>100%</Text>
         </View>
       </View>
 
@@ -110,15 +155,10 @@ export default function IPhoneScreen() {
               onPress={() => handlePress(item)}
               activeOpacity={0.7}
             >
-              {/* 再生ボタンアイコン */}
               <View style={[s.playIcon, isPlaying && s.playIconActive]}>
                 <Text style={s.playIconText}>{isPlaying ? '⏹' : '▶'}</Text>
               </View>
-
-              {/* ファイル名 */}
               <Text style={s.fileName} numberOfLines={2}>{item.name}</Text>
-
-              {/* 再生中バッジ */}
               {isPlaying && (
                 <View style={s.playingBadge}>
                   <Text style={s.playingBadgeText}>再生中</Text>
@@ -164,8 +204,22 @@ const s = StyleSheet.create({
   dotOff:         { backgroundColor: '#2a2a3a' },
   badgeText:      { color: '#5a5a7a', fontSize: 11 },
 
+  // 音量カード
+  volumeCard: {
+    marginHorizontal: 20, marginTop: 14, marginBottom: 6,
+    backgroundColor: '#0e0e1a', borderRadius: 16,
+    paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8,
+    borderWidth: 1, borderColor: '#1a1a2e',
+  },
+  volumeHeader:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  volumeLabel:    { color: '#8888aa', fontSize: 13, fontWeight: '600' },
+  volumeValue:    { color: '#00e5a0', fontSize: 18, fontWeight: '800', minWidth: 46, textAlign: 'right' },
+  slider:         { width: '100%', height: 40 },
+  volumeTicks:    { flexDirection: 'row', justifyContent: 'space-between', marginTop: -4 },
+  volumeTick:     { color: '#2a2a4a', fontSize: 10 },
+
   stopAllBtn: {
-    marginHorizontal: 20, marginTop: 16, marginBottom: 4,
+    marginHorizontal: 20, marginTop: 12, marginBottom: 4,
     backgroundColor: '#cc2244', borderRadius: 16,
     paddingVertical: 16, alignItems: 'center',
   },

@@ -2,6 +2,7 @@
 //  AndroidScreen.js
 //  ・音声ファイルの登録（端末ストレージから選択）
 //  ・Firebase を監視し、iPhone からのコマンドで再生/停止
+//  ・Firebase の volume ノードを監視して再生中の音量をリアルタイム反映
 // ============================================================
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -16,17 +17,22 @@ import { ref, set, onValue, push, remove } from 'firebase/database';
 // ── Firebase データ構造 ────────────────────────────────────────
 //  audioFiles/{id}: { name, uri, registeredAt }
 //  command:         { action: 'play'|'stop', fileId, timestamp }
+//  volume:          number (0.0〜1.0)
 // ─────────────────────────────────────────────────────────────
+
+const DEFAULT_VOLUME = 0.8;
 
 export default function AndroidScreen() {
   const [audioFiles, setAudioFiles]   = useState([]);
   const [playingId,  setPlayingId]    = useState(null);
   const [statusMsg,  setStatusMsg]    = useState('待機中');
   const [loading,    setLoading]      = useState(false);
+  const [volume,     setVolume]       = useState(DEFAULT_VOLUME);
 
   const soundRef          = useRef(null);
-  const audioFilesRef     = useRef([]);       // stale closure 対策
-  const lastTimestampRef  = useRef(0);        // 重複コマンド防止
+  const audioFilesRef     = useRef([]);
+  const lastTimestampRef  = useRef(0);
+  const volumeRef         = useRef(DEFAULT_VOLUME);  // 再生開始時に参照する音量
 
   // ── 初期化：オーディオ権限とモード設定 ──────────────────────
   useEffect(() => {
@@ -39,7 +45,7 @@ export default function AndroidScreen() {
     })();
   }, []);
 
-  // ── audioFiles を ref にも保持（コマンドリスナーが常に最新値を参照）──
+  // ── audioFiles を ref にも保持 ───────────────────────────────
   useEffect(() => {
     audioFilesRef.current = audioFiles;
   }, [audioFiles]);
@@ -56,6 +62,25 @@ export default function AndroidScreen() {
         setAudioFiles(files);
       } else {
         setAudioFiles([]);
+      }
+    });
+  }, []);
+
+  // ── Firebase: 音量ノードを監視 ──────────────────────────────
+  useEffect(() => {
+    const vRef = ref(database, 'volume');
+    return onValue(vRef, async (snapshot) => {
+      const v = snapshot.val();
+      if (v === null || typeof v !== 'number') return;
+
+      volumeRef.current = v;
+      setVolume(v);
+
+      // 再生中のサウンドにリアルタイム反映
+      if (soundRef.current) {
+        try {
+          await soundRef.current.setVolumeAsync(v);
+        } catch (_) {}
       }
     });
   }, []);
@@ -95,7 +120,7 @@ export default function AndroidScreen() {
 
       const { sound } = await Audio.Sound.createAsync(
         { uri: file.uri },
-        { shouldPlay: true },
+        { shouldPlay: true, volume: volumeRef.current },  // 登録済み音量で再生開始
         (status) => {
           if (status.didJustFinish) {
             setPlayingId(null);
@@ -139,29 +164,12 @@ export default function AndroidScreen() {
       const picked = result.assets[0];
       setLoading(true);
 
-      // 10秒でタイムアウト（Firebase接続失敗の検出用）
-      const writeWithTimeout = (promise, ms = 10000) =>
-        Promise.race([
-          promise,
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(
-              'タイムアウト：Firebase への接続を確認してください\n' +
-              '① databaseURL が正しいか\n' +
-              '② データベースのルールが read/write: true になっているか'
-            )), ms)
-          ),
-        ]);
-
-      // copyToCacheDirectory: true により picked.uri は既に file:// URI
-      // FileSystem によるコピーは不要、そのまま Firebase に登録
       const newRef = push(ref(database, 'audioFiles'));
-      await writeWithTimeout(
-        set(newRef, {
-          name:         picked.name,
-          uri:          picked.uri,
-          registeredAt: Date.now(),
-        })
-      );
+      await set(newRef, {
+        name:         picked.name,
+        uri:          picked.uri,
+        registeredAt: Date.now(),
+      });
 
       Alert.alert('登録完了', `「${picked.name}」を登録しました`);
     } catch (e) {
@@ -195,10 +203,11 @@ export default function AndroidScreen() {
         <Text style={s.headerSub}>音声ファイル管理</Text>
       </View>
 
-      {/* ステータス表示 */}
+      {/* ステータス表示（音量も表示） */}
       <View style={s.statusCard}>
         <View style={[s.statusDot, playingId ? s.dotPlaying : s.dotIdle]} />
         <Text style={s.statusText}>{statusMsg}</Text>
+        <Text style={s.volumeDisplay}>🔈 {Math.round(volume * 100)}%</Text>
       </View>
 
       {/* 登録ボタン */}
@@ -269,7 +278,8 @@ const s = StyleSheet.create({
   statusDot:      { width: 10, height: 10, borderRadius: 5, marginRight: 10 },
   dotIdle:        { backgroundColor: '#2a2a4a' },
   dotPlaying:     { backgroundColor: '#00e5a0' },
-  statusText:     { color: '#8888aa', fontSize: 13 },
+  statusText:     { color: '#8888aa', fontSize: 13, flex: 1 },
+  volumeDisplay:  { color: '#4a4a6a', fontSize: 12 },
 
   addBtn: {
     marginHorizontal: 20, marginBottom: 20,
