@@ -1,40 +1,73 @@
 // ============================================================
-//  AndroidScreen.js
-//  ・音声ファイルの登録（端末ストレージから選択）
-//  ・Firebase を監視し、iPhone からのコマンドで再生/停止
-//  ・Firebase の volume ノードを監視して再生中の音量をリアルタイム反映
+//  ControlledScreen.js（旧 AndroidScreen を iOS/Android 両対応に拡張）
+//  ・音声ファイルの登録・再生
+//  ・バイブレーションの受信・実行（iOS: expo-haptics / Android: Vibration）
 // ============================================================
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity,
-  StyleSheet, Alert, SafeAreaView, ActivityIndicator,
+  View, Text, FlatList, TouchableOpacity, Vibration,
+  StyleSheet, Alert, SafeAreaView, ActivityIndicator, Platform,
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
+import * as Haptics from 'expo-haptics';
 import { Audio } from 'expo-av';
 import { database } from './firebaseConfig';
 import { ref, set, onValue, push, remove } from 'firebase/database';
 
-// ── Firebase データ構造 ────────────────────────────────────────
-//  audioFiles/{id}: { name, uri, registeredAt }
-//  command:         { action: 'play'|'stop', fileId, timestamp }
-//  volume:          number (0.0〜1.0)
-// ─────────────────────────────────────────────────────────────
-
 const DEFAULT_VOLUME = 0.8;
 
-export default function AndroidScreen() {
+// ── バイブレーション実行（iOS: Haptics / Android: Vibration API）──
+const executeVibration = async (pattern) => {
+  if (Platform.OS === 'ios') {
+    switch (pattern) {
+      case 'short':
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        break;
+      case 'long':
+        // 重い振動を3回繰り返す
+        for (let i = 0; i < 3; i++) {
+          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+          if (i < 2) await new Promise(r => setTimeout(r, 150));
+        }
+        break;
+      case 'pattern':
+        // 短い振動を3連続
+        for (let i = 0; i < 3; i++) {
+          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+          if (i < 2) await new Promise(r => setTimeout(r, 200));
+        }
+        break;
+    }
+  } else {
+    // Android: Vibration API（ms 単位でパターン指定可能）
+    switch (pattern) {
+      case 'short':
+        Vibration.vibrate(200);
+        break;
+      case 'long':
+        Vibration.vibrate([0, 400, 150, 400, 150, 400]);
+        break;
+      case 'pattern':
+        Vibration.vibrate([0, 200, 100, 200, 100, 200]);
+        break;
+    }
+  }
+};
+
+export default function ControlledScreen({ onReset }) {
   const [audioFiles, setAudioFiles]   = useState([]);
   const [playingId,  setPlayingId]    = useState(null);
   const [statusMsg,  setStatusMsg]    = useState('待機中');
   const [loading,    setLoading]      = useState(false);
   const [volume,     setVolume]       = useState(DEFAULT_VOLUME);
+  const [lastVibrate, setLastVibrate] = useState(null); // 最後のバイブ種別を表示用に保持
 
-  const soundRef          = useRef(null);
-  const audioFilesRef     = useRef([]);
-  const lastTimestampRef  = useRef(0);
-  const volumeRef         = useRef(DEFAULT_VOLUME);  // 再生開始時に参照する音量
+  const soundRef         = useRef(null);
+  const audioFilesRef    = useRef([]);
+  const lastTimestampRef = useRef(0);
+  const volumeRef        = useRef(DEFAULT_VOLUME);
 
-  // ── 初期化：オーディオ権限とモード設定 ──────────────────────
+  // ── 初期化 ──────────────────────────────────────────────────
   useEffect(() => {
     (async () => {
       await Audio.requestPermissionsAsync();
@@ -45,15 +78,11 @@ export default function AndroidScreen() {
     })();
   }, []);
 
-  // ── audioFiles を ref にも保持 ───────────────────────────────
-  useEffect(() => {
-    audioFilesRef.current = audioFiles;
-  }, [audioFiles]);
+  useEffect(() => { audioFilesRef.current = audioFiles; }, [audioFiles]);
 
-  // ── Firebase: 登録済みファイル一覧を監視 ────────────────────
+  // ── Firebase: ファイル一覧を監視 ─────────────────────────────
   useEffect(() => {
-    const filesRef = ref(database, 'audioFiles');
-    return onValue(filesRef, (snapshot) => {
+    return onValue(ref(database, 'audioFiles'), (snapshot) => {
       const data = snapshot.val();
       if (data) {
         const files = Object.entries(data)
@@ -66,29 +95,22 @@ export default function AndroidScreen() {
     });
   }, []);
 
-  // ── Firebase: 音量ノードを監視 ──────────────────────────────
+  // ── Firebase: 音量を監視 ─────────────────────────────────────
   useEffect(() => {
-    const vRef = ref(database, 'volume');
-    return onValue(vRef, async (snapshot) => {
+    return onValue(ref(database, 'volume'), async (snapshot) => {
       const v = snapshot.val();
       if (v === null || typeof v !== 'number') return;
-
       volumeRef.current = v;
       setVolume(v);
-
-      // 再生中のサウンドにリアルタイム反映
       if (soundRef.current) {
-        try {
-          await soundRef.current.setVolumeAsync(v);
-        } catch (_) {}
+        try { await soundRef.current.setVolumeAsync(v); } catch (_) {}
       }
     });
   }, []);
 
-  // ── Firebase: iPhone からのコマンドを監視 ───────────────────
+  // ── Firebase: コマンドを監視（再生 / 停止 / バイブ）──────────
   useEffect(() => {
-    const commandRef = ref(database, 'command');
-    return onValue(commandRef, async (snapshot) => {
+    return onValue(ref(database, 'command'), async (snapshot) => {
       const cmd = snapshot.val();
       if (!cmd) return;
       if (cmd.timestamp <= lastTimestampRef.current) return;
@@ -96,13 +118,17 @@ export default function AndroidScreen() {
 
       if (cmd.action === 'play' && cmd.fileId) {
         const file = audioFilesRef.current.find(f => f.id === cmd.fileId);
-        if (file) {
-          await playAudio(file);
-        } else {
-          setStatusMsg('⚠️ ファイルが見つかりません');
-        }
+        if (file) await playAudio(file);
+        else setStatusMsg('⚠️ ファイルが見つかりません');
+
       } else if (cmd.action === 'stop') {
         await stopAudio();
+
+      } else if (cmd.action === 'vibrate') {
+        await executeVibration(cmd.pattern);
+        const labels = { short: '短い', long: '長い', pattern: 'パターン' };
+        setLastVibrate(`📳 ${labels[cmd.pattern] || ''} バイブ受信`);
+        setTimeout(() => setLastVibrate(null), 2000);
       }
     });
   }, []);
@@ -115,12 +141,10 @@ export default function AndroidScreen() {
         await soundRef.current.unloadAsync();
         soundRef.current = null;
       }
-
-      setStatusMsg(`読み込み中…`);
-
+      setStatusMsg('読み込み中…');
       const { sound } = await Audio.Sound.createAsync(
         { uri: file.uri },
-        { shouldPlay: true, volume: volumeRef.current },  // 登録済み音量で再生開始
+        { shouldPlay: true, volume: volumeRef.current },
         (status) => {
           if (status.didJustFinish) {
             setPlayingId(null);
@@ -128,7 +152,6 @@ export default function AndroidScreen() {
           }
         }
       );
-
       soundRef.current = sound;
       setPlayingId(file.id);
       setStatusMsg(`▶ 再生中: ${file.name}`);
@@ -151,14 +174,13 @@ export default function AndroidScreen() {
     setTimeout(() => setStatusMsg('待機中'), 2000);
   };
 
-  // ── 音声ファイルを選択して Firebase に登録 ─────────────────
+  // ── ファイル登録 ──────────────────────────────────────────
   const pickAndRegisterFile = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: 'audio/*',
         copyToCacheDirectory: true,
       });
-
       if (result.canceled || !result.assets?.length) return;
 
       const picked = result.assets[0];
@@ -166,11 +188,8 @@ export default function AndroidScreen() {
 
       const newRef = push(ref(database, 'audioFiles'));
       await set(newRef, {
-        name:         picked.name,
-        uri:          picked.uri,
-        registeredAt: Date.now(),
+        name: picked.name, uri: picked.uri, registeredAt: Date.now(),
       });
-
       Alert.alert('登録完了', `「${picked.name}」を登録しました`);
     } catch (e) {
       Alert.alert('エラー', 'ファイルの登録に失敗しました:\n' + e.message);
@@ -179,13 +198,12 @@ export default function AndroidScreen() {
     }
   };
 
-  // ── ファイル削除 ───────────────────────────────────────────
+  // ── ファイル削除 ──────────────────────────────────────────
   const deleteFile = (id, name) => {
     Alert.alert('削除の確認', `「${name}」を削除しますか？`, [
       { text: 'キャンセル', style: 'cancel' },
       {
-        text: '削除',
-        style: 'destructive',
+        text: '削除', style: 'destructive',
         onPress: async () => {
           if (playingId === id) await stopAudio();
           await remove(ref(database, `audioFiles/${id}`));
@@ -194,19 +212,23 @@ export default function AndroidScreen() {
     ]);
   };
 
-  // ── UI ────────────────────────────────────────────────────
   return (
     <SafeAreaView style={s.container}>
       {/* ヘッダー */}
       <View style={s.header}>
-        <Text style={s.headerTitle}>🎵 Android</Text>
-        <Text style={s.headerSub}>音声ファイル管理</Text>
+        <View>
+          <Text style={s.headerTitle}>🔊 被制御端末</Text>
+          <Text style={s.headerSub}>音声管理</Text>
+        </View>
+        <TouchableOpacity onPress={onReset} style={s.resetBtn}>
+          <Text style={s.resetText}>役割変更</Text>
+        </TouchableOpacity>
       </View>
 
-      {/* ステータス表示（音量も表示） */}
+      {/* ステータス */}
       <View style={s.statusCard}>
         <View style={[s.statusDot, playingId ? s.dotPlaying : s.dotIdle]} />
-        <Text style={s.statusText}>{statusMsg}</Text>
+        <Text style={s.statusText}>{lastVibrate || statusMsg}</Text>
         <Text style={s.volumeDisplay}>🔈 {Math.round(volume * 100)}%</Text>
       </View>
 
@@ -222,10 +244,7 @@ export default function AndroidScreen() {
         }
       </TouchableOpacity>
 
-      {/* ファイル一覧 */}
-      <Text style={s.listLabel}>
-        登録済みファイル ({audioFiles.length} 件)
-      </Text>
+      <Text style={s.listLabel}>登録済みファイル ({audioFiles.length} 件)</Text>
 
       <FlatList
         data={audioFiles}
@@ -234,9 +253,7 @@ export default function AndroidScreen() {
         renderItem={({ item }) => (
           <View style={[s.fileRow, playingId === item.id && s.fileRowActive]}>
             <View style={s.fileIcon}>
-              <Text style={s.fileIconText}>
-                {playingId === item.id ? '▶' : '♪'}
-              </Text>
+              <Text style={s.fileIconText}>{playingId === item.id ? '▶' : '♪'}</Text>
             </View>
             <Text style={s.fileName} numberOfLines={2}>{item.name}</Text>
             <TouchableOpacity
@@ -251,9 +268,7 @@ export default function AndroidScreen() {
         ListEmptyComponent={
           <View style={s.empty}>
             <Text style={s.emptyIcon}>🎵</Text>
-            <Text style={s.emptyText}>
-              上のボタンで音声ファイルを{'\n'}登録してください
-            </Text>
+            <Text style={s.emptyText}>上のボタンで音声ファイルを{'\n'}登録してください</Text>
           </View>
         }
       />
@@ -261,12 +276,21 @@ export default function AndroidScreen() {
   );
 }
 
-// ── スタイル ─────────────────────────────────────────────────
 const s = StyleSheet.create({
   container:      { flex: 1, backgroundColor: '#080812' },
-  header:         { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 4 },
-  headerTitle:    { fontSize: 26, fontWeight: '800', color: '#ffffff', letterSpacing: -0.5 },
+  header: {
+    flexDirection: 'row', justifyContent: 'space-between',
+    alignItems: 'flex-start', paddingHorizontal: 20,
+    paddingTop: 16, paddingBottom: 4,
+  },
+  headerTitle:    { fontSize: 20, fontWeight: '800', color: '#ffffff' },
   headerSub:      { fontSize: 13, color: '#4a4a6a', marginTop: 2 },
+  resetBtn: {
+    backgroundColor: '#1a1a2a', borderRadius: 10,
+    paddingHorizontal: 10, paddingVertical: 6,
+    borderWidth: 1, borderColor: '#2a2a3a', marginTop: 2,
+  },
+  resetText:      { color: '#5a5a7a', fontSize: 11 },
 
   statusCard: {
     flexDirection: 'row', alignItems: 'center',
