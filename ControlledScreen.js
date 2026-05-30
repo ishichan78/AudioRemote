@@ -1,7 +1,8 @@
 // ============================================================
-//  ControlledScreen.js（旧 AndroidScreen を iOS/Android 両対応に拡張）
+//  ControlledScreen.js
 //  ・音声ファイルの登録・再生
-//  ・バイブレーションの受信・実行（iOS: expo-haptics / Android: Vibration）
+//  ・再生モード対応: 1回のみ / ループ / 指定時刻まで
+//  ・バイブレーション受信
 // ============================================================
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -16,7 +17,7 @@ import { ref, set, onValue, push, remove } from 'firebase/database';
 
 const DEFAULT_VOLUME = 0.8;
 
-// ── バイブレーション実行（iOS: Haptics / Android: Vibration API）──
+// ── バイブレーション実行 ──────────────────────────────────────
 const executeVibration = async (pattern) => {
   if (Platform.OS === 'ios') {
     switch (pattern) {
@@ -24,14 +25,12 @@ const executeVibration = async (pattern) => {
         await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
         break;
       case 'long':
-        // 重い振動を3回繰り返す
         for (let i = 0; i < 3; i++) {
           await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
           if (i < 2) await new Promise(r => setTimeout(r, 150));
         }
         break;
       case 'pattern':
-        // 短い振動を3連続
         for (let i = 0; i < 3; i++) {
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
           if (i < 2) await new Promise(r => setTimeout(r, 200));
@@ -39,35 +38,40 @@ const executeVibration = async (pattern) => {
         break;
     }
   } else {
-    // Android: Vibration API（ms 単位でパターン指定可能）
     switch (pattern) {
-      case 'short':
-        Vibration.vibrate(200);
-        break;
-      case 'long':
-        Vibration.vibrate([0, 400, 150, 400, 150, 400]);
-        break;
-      case 'pattern':
-        Vibration.vibrate([0, 200, 100, 200, 100, 200]);
-        break;
+      case 'short':   Vibration.vibrate(200); break;
+      case 'long':    Vibration.vibrate([0, 400, 150, 400, 150, 400]); break;
+      case 'pattern': Vibration.vibrate([0, 200, 100, 200, 100, 200]); break;
     }
   }
 };
 
+// ── 指定時刻までのミリ秒を計算（過去なら翌日として計算）───────
+const msUntilTime = (hhmm) => {
+  const [hours, minutes] = hhmm.split(':').map(Number);
+  const now = new Date();
+  const target = new Date();
+  target.setHours(hours, minutes, 0, 0);
+  if (target <= now) target.setDate(target.getDate() + 1);
+  return target - now;
+};
+
 export default function ControlledScreen({ onReset }) {
-  const [audioFiles, setAudioFiles]   = useState([]);
-  const [playingId,  setPlayingId]    = useState(null);
-  const [statusMsg,  setStatusMsg]    = useState('待機中');
-  const [loading,    setLoading]      = useState(false);
-  const [volume,     setVolume]       = useState(DEFAULT_VOLUME);
-  const [lastVibrate, setLastVibrate] = useState(null); // 最後のバイブ種別を表示用に保持
+  const [audioFiles,  setAudioFiles]  = useState([]);
+  const [playingId,   setPlayingId]   = useState(null);
+  const [playingMode, setPlayingMode] = useState(null);
+  const [statusMsg,   setStatusMsg]   = useState('待機中');
+  const [loading,     setLoading]     = useState(false);
+  const [volume,      setVolume]      = useState(DEFAULT_VOLUME);
+  const [lastVibrate, setLastVibrate] = useState(null);
 
   const soundRef         = useRef(null);
   const audioFilesRef    = useRef([]);
   const lastTimestampRef = useRef(0);
   const volumeRef        = useRef(DEFAULT_VOLUME);
+  const stopTimerRef     = useRef(null);  // 指定時刻モードの停止タイマー
 
-  // ── 初期化 ──────────────────────────────────────────────────
+  // ── 初期化 ───────────────────────────────────────────────
   useEffect(() => {
     (async () => {
       await Audio.requestPermissionsAsync();
@@ -76,11 +80,15 @@ export default function ControlledScreen({ onReset }) {
         shouldDuckAndroid: false,
       });
     })();
+    // アンマウント時にタイマー解除
+    return () => {
+      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+    };
   }, []);
 
   useEffect(() => { audioFilesRef.current = audioFiles; }, [audioFiles]);
 
-  // ── Firebase: ファイル一覧を監視 ─────────────────────────────
+  // ── Firebase: ファイル一覧 ───────────────────────────────
   useEffect(() => {
     return onValue(ref(database, 'audioFiles'), (snapshot) => {
       const data = snapshot.val();
@@ -95,7 +103,7 @@ export default function ControlledScreen({ onReset }) {
     });
   }, []);
 
-  // ── Firebase: 音量を監視 ─────────────────────────────────────
+  // ── Firebase: 音量 ──────────────────────────────────────
   useEffect(() => {
     return onValue(ref(database, 'volume'), async (snapshot) => {
       const v = snapshot.val();
@@ -108,7 +116,7 @@ export default function ControlledScreen({ onReset }) {
     });
   }, []);
 
-  // ── Firebase: コマンドを監視（再生 / 停止 / バイブ）──────────
+  // ── Firebase: コマンド受信 ───────────────────────────────
   useEffect(() => {
     return onValue(ref(database, 'command'), async (snapshot) => {
       const cmd = snapshot.val();
@@ -118,12 +126,13 @@ export default function ControlledScreen({ onReset }) {
 
       if (cmd.action === 'play' && cmd.fileId) {
         const file = audioFilesRef.current.find(f => f.id === cmd.fileId);
-        if (file) await playAudio(file);
-        else setStatusMsg('⚠️ ファイルが見つかりません');
-
+        if (file) {
+          await playAudio(file, cmd.mode || 'once', cmd.untilTime || null);
+        } else {
+          setStatusMsg('⚠️ ファイルが見つかりません');
+        }
       } else if (cmd.action === 'stop') {
         await stopAudio();
-
       } else if (cmd.action === 'vibrate') {
         await executeVibration(cmd.pattern);
         const labels = { short: '短い', long: '長い', pattern: 'パターン' };
@@ -133,48 +142,86 @@ export default function ControlledScreen({ onReset }) {
     });
   }, []);
 
-  // ── 再生 ──────────────────────────────────────────────────
-  const playAudio = async (file) => {
+  // ── 再生 ────────────────────────────────────────────────
+  const playAudio = async (file, mode, untilTime) => {
+    // 既存タイマーをリセット
+    if (stopTimerRef.current) {
+      clearTimeout(stopTimerRef.current);
+      stopTimerRef.current = null;
+    }
+
     try {
       if (soundRef.current) {
         await soundRef.current.stopAsync();
         await soundRef.current.unloadAsync();
         soundRef.current = null;
       }
+
       setStatusMsg('読み込み中…');
+
+      const isLooping = (mode === 'loop' || mode === 'until');
+
       const { sound } = await Audio.Sound.createAsync(
         { uri: file.uri },
-        { shouldPlay: true, volume: volumeRef.current },
+        { shouldPlay: true, volume: volumeRef.current, isLooping },
         (status) => {
-          if (status.didJustFinish) {
+          // 1回再生モードで終端まで再生した場合
+          if (status.didJustFinish && mode === 'once') {
             setPlayingId(null);
+            setPlayingMode(null);
             setStatusMsg('待機中');
           }
         }
       );
+
       soundRef.current = sound;
       setPlayingId(file.id);
-      setStatusMsg(`▶ 再生中: ${file.name}`);
+      setPlayingMode(mode);
+
+      // モード別ステータスメッセージとタイマー設定
+      if (mode === 'loop') {
+        setStatusMsg(`🔁 ループ再生中: ${file.name}`);
+      } else if (mode === 'until' && untilTime) {
+        const ms = msUntilTime(untilTime);
+        const h = Math.floor(ms / 3600000);
+        const m = Math.floor((ms % 3600000) / 60000);
+        const remaining = h > 0 ? `約${h}時間${m}分後に停止` : `約${m}分後に停止`;
+        setStatusMsg(`⏰ ${untilTime}まで再生中: ${file.name}（${remaining}）`);
+
+        stopTimerRef.current = setTimeout(async () => {
+          await stopAudio();
+          setStatusMsg(`⏰ ${untilTime} に自動停止しました`);
+          setTimeout(() => setStatusMsg('待機中'), 3000);
+        }, ms);
+      } else {
+        setStatusMsg(`▶ 再生中: ${file.name}`);
+      }
     } catch (e) {
       setPlayingId(null);
+      setPlayingMode(null);
       setStatusMsg('⚠️ 再生エラー');
       Alert.alert('再生エラー', e.message);
     }
   };
 
-  // ── 停止 ──────────────────────────────────────────────────
+  // ── 停止 ────────────────────────────────────────────────
   const stopAudio = async () => {
+    if (stopTimerRef.current) {
+      clearTimeout(stopTimerRef.current);
+      stopTimerRef.current = null;
+    }
     if (soundRef.current) {
       await soundRef.current.stopAsync();
       await soundRef.current.unloadAsync();
       soundRef.current = null;
     }
     setPlayingId(null);
+    setPlayingMode(null);
     setStatusMsg('⏹ 停止しました');
     setTimeout(() => setStatusMsg('待機中'), 2000);
   };
 
-  // ── ファイル登録 ──────────────────────────────────────────
+  // ── ファイル登録 ─────────────────────────────────────────
   const pickAndRegisterFile = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -198,7 +245,7 @@ export default function ControlledScreen({ onReset }) {
     }
   };
 
-  // ── ファイル削除 ──────────────────────────────────────────
+  // ── ファイル削除 ─────────────────────────────────────────
   const deleteFile = (id, name) => {
     Alert.alert('削除の確認', `「${name}」を削除しますか？`, [
       { text: 'キャンセル', style: 'cancel' },
@@ -210,6 +257,13 @@ export default function ControlledScreen({ onReset }) {
         },
       },
     ]);
+  };
+
+  // ── モードバッジ表示テキスト ─────────────────────────────
+  const modeBadge = () => {
+    if (playingMode === 'loop')  return '🔁 ループ';
+    if (playingMode === 'until') return '⏰ 時刻指定';
+    return '▶ 1回';
   };
 
   return (
@@ -227,8 +281,14 @@ export default function ControlledScreen({ onReset }) {
 
       {/* ステータス */}
       <View style={s.statusCard}>
-        <View style={[s.statusDot, playingId ? s.dotPlaying : s.dotIdle]} />
-        <Text style={s.statusText}>{lastVibrate || statusMsg}</Text>
+        <View style={[s.statusDot,
+          playingMode === 'loop'  ? s.dotLoop  :
+          playingMode === 'until' ? s.dotUntil :
+          playingId               ? s.dotPlaying : s.dotIdle
+        ]} />
+        <Text style={s.statusText} numberOfLines={2}>
+          {lastVibrate || statusMsg}
+        </Text>
         <Text style={s.volumeDisplay}>🔈 {Math.round(volume * 100)}%</Text>
       </View>
 
@@ -250,21 +310,29 @@ export default function ControlledScreen({ onReset }) {
         data={audioFiles}
         keyExtractor={(item) => item.id}
         contentContainerStyle={s.list}
-        renderItem={({ item }) => (
-          <View style={[s.fileRow, playingId === item.id && s.fileRowActive]}>
-            <View style={s.fileIcon}>
-              <Text style={s.fileIconText}>{playingId === item.id ? '▶' : '♪'}</Text>
+        renderItem={({ item }) => {
+          const isPlaying = playingId === item.id;
+          return (
+            <View style={[s.fileRow, isPlaying && s.fileRowActive]}>
+              <View style={s.fileIcon}>
+                <Text style={s.fileIconText}>{isPlaying ? '▶' : '♪'}</Text>
+              </View>
+              <View style={s.fileInfo}>
+                <Text style={s.fileName} numberOfLines={2}>{item.name}</Text>
+                {isPlaying && (
+                  <Text style={s.modeBadgeText}>{modeBadge()}</Text>
+                )}
+              </View>
+              <TouchableOpacity
+                onPress={() => deleteFile(item.id, item.name)}
+                style={s.deleteBtn}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text style={s.deleteBtnText}>削除</Text>
+              </TouchableOpacity>
             </View>
-            <Text style={s.fileName} numberOfLines={2}>{item.name}</Text>
-            <TouchableOpacity
-              onPress={() => deleteFile(item.id, item.name)}
-              style={s.deleteBtn}
-              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            >
-              <Text style={s.deleteBtnText}>削除</Text>
-            </TouchableOpacity>
-          </View>
-        )}
+          );
+        }}
         ListEmptyComponent={
           <View style={s.empty}>
             <Text style={s.emptyIcon}>🎵</Text>
@@ -299,11 +367,13 @@ const s = StyleSheet.create({
     paddingHorizontal: 14, paddingVertical: 12,
     borderWidth: 1, borderColor: '#1a1a30',
   },
-  statusDot:      { width: 10, height: 10, borderRadius: 5, marginRight: 10 },
+  statusDot:      { width: 10, height: 10, borderRadius: 5, marginRight: 10, flexShrink: 0 },
   dotIdle:        { backgroundColor: '#2a2a4a' },
   dotPlaying:     { backgroundColor: '#00e5a0' },
-  statusText:     { color: '#8888aa', fontSize: 13, flex: 1 },
-  volumeDisplay:  { color: '#4a4a6a', fontSize: 12 },
+  dotLoop:        { backgroundColor: '#7c6af7' },
+  dotUntil:       { backgroundColor: '#f7a44a' },
+  statusText:     { color: '#8888aa', fontSize: 12, flex: 1, lineHeight: 17 },
+  volumeDisplay:  { color: '#4a4a6a', fontSize: 12, flexShrink: 0 },
 
   addBtn: {
     marginHorizontal: 20, marginBottom: 20,
@@ -331,14 +401,16 @@ const s = StyleSheet.create({
   fileIcon: {
     width: 40, height: 40, borderRadius: 20,
     backgroundColor: '#1a1a30', alignItems: 'center',
-    justifyContent: 'center', marginRight: 12,
+    justifyContent: 'center', marginRight: 12, flexShrink: 0,
   },
   fileIconText:   { fontSize: 18 },
-  fileName:       { flex: 1, color: '#ccccdd', fontSize: 13, lineHeight: 19 },
+  fileInfo:       { flex: 1 },
+  fileName:       { color: '#ccccdd', fontSize: 13, lineHeight: 19 },
+  modeBadgeText:  { color: '#00e5a0', fontSize: 11, marginTop: 3 },
   deleteBtn: {
     backgroundColor: '#1a0a10', borderRadius: 8,
     paddingHorizontal: 10, paddingVertical: 6,
-    borderWidth: 1, borderColor: '#40101a',
+    borderWidth: 1, borderColor: '#40101a', marginLeft: 10,
   },
   deleteBtnText:  { color: '#cc3355', fontSize: 12, fontWeight: '600' },
 
